@@ -4,6 +4,7 @@ from urllib.parse import urljoin
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.logging import get_logger
+from mcp.server.transport_security import TransportSecuritySettings
 
 ### Constants ###
 
@@ -363,6 +364,11 @@ def main():
     if args.transport == "sse":
         mcp.settings.host = args.host
         mcp.settings.port = args.port
+        # Disable DNS rebinding protection for SSE transport.
+        # This server is designed for closed/trusted networks only.
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        )
     mcp.run(transport=args.transport)
 
 if __name__ == "__main__":
