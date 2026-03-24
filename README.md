@@ -12,10 +12,14 @@ Let Claude be your Redmine assistant! MCP Redmine connects Claude Desktop to you
 - Manage and track time entries
 - Update issue statuses and fields
 - Access comprehensive Redmine API functionality
+- **Multi-user support** via user identifier to API key mapping (for orchestrated environments like n8n + OpenWebUI)
 
 Uses httpx for API requests and integrates with the Redmine OpenAPI specification for comprehensive API coverage.
 
 ![MCP Redmine in action](https://raw.githubusercontent.com/runekaagaard/mcp-redmine/refs/heads/main/screenshot.png)
+
+> [!CAUTION]
+> **Multi-user mode is designed exclusively for use in closed, trusted networks (e.g. internal company infrastructure behind a VPN/firewall). It must NEVER be exposed to the public internet.** The user-to-API-key mapping file contains sensitive credentials. The `user_identifier` parameter is passed as a plain tool call argument and is not cryptographically verified — any client that can reach this MCP server can impersonate any user. Only deploy this in environments where all clients are trusted and network access is strictly controlled.
 
 
 ## Usage with Claude Desktop
@@ -64,7 +68,7 @@ Add to your `claude_desktop_config.json`:
 
 ### 2. Installation using `docker`
 
-Ensure you have docker installed. 
+Ensure you have docker installed.
 ```bash
 docker --version
 ```
@@ -104,12 +108,137 @@ Add to your `claude_desktop_config.json`:
   }
   ```
 
+## Multi-User Mode (n8n + OpenWebUI)
+
+Multi-user mode allows a single MCP server instance to serve multiple Redmine users, each authenticated with their own API key. This is designed for orchestrated environments where a middleware (like **n8n**) sits between the user-facing UI (like **OpenWebUI**) and this MCP server.
+
+> [!CAUTION]
+> **This mode is intended ONLY for closed, trusted networks.** See the security warning at the top of this document.
+
+### How It Works
+
+```
+User (OpenWebUI) ──→ n8n (knows user email) ──→ MCP tool call + user_identifier ──→ mcp-redmine ──→ Redmine API
+```
+
+1. The user chats in OpenWebUI, which passes the user's email to n8n.
+2. n8n calls MCP tools and includes the `user_identifier` parameter (the user's email) in **every** tool call.
+3. mcp-redmine looks up the user's Redmine API key from the configured users map file.
+4. The request is made to Redmine using that user's API key, so all actions respect that user's Redmine permissions.
+
+### Configuration
+
+#### 1. Create a users map file
+
+Create a JSON file mapping user identifiers (emails) to their Redmine API keys:
+
+```json
+{
+  "jan.kowalski@company.com": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+  "anna.nowak@company.com": "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5"
+}
+```
+
+Save it e.g. as `/config/redmine_users.json`.
+
+> **Hot-reload**: The users map file is re-read on every request. You can add or remove users without restarting the MCP server.
+
+#### 2. Configure environment variables
+
+Set `REDMINE_USERS_MAP` instead of (or in addition to) `REDMINE_API_KEY`:
+
+```bash
+# Required
+REDMINE_URL=https://redmine.company.com
+REDMINE_USERS_MAP=/config/redmine_users.json
+
+# Optional: fallback key used when no user_identifier is provided
+REDMINE_API_KEY=fallback-api-key
+```
+
+Alternatively, for simple setups, you can pass the map as inline JSON:
+
+```bash
+REDMINE_USERS_MAP='{"jan.kowalski@company.com": "key1", "anna.nowak@company.com": "key2"}'
+```
+
+#### 3. Docker deployment example (SSE transport)
+
+```bash
+docker run -d \
+  --name mcp-redmine \
+  -e REDMINE_URL=https://redmine.company.com \
+  -e REDMINE_USERS_MAP=/config/redmine_users.json \
+  -v /path/to/redmine_users.json:/config/redmine_users.json:ro \
+  -p 8000:8000 \
+  mcp-redmine \
+  --transport sse --host 0.0.0.0 --port 8000
+```
+
+### n8n Integration
+
+When calling MCP tools from n8n, **every tool call MUST include the `user_identifier` parameter**. This is how the server knows which user's API key to use.
+
+Example n8n tool call payload:
+
+```json
+{
+  "tool": "redmine_request",
+  "arguments": {
+    "path": "/issues.json",
+    "method": "get",
+    "params": {"project_id": "my-project"},
+    "user_identifier": "jan.kowalski@company.com"
+  }
+}
+```
+
+Another example (creating an issue):
+
+```json
+{
+  "tool": "redmine_request",
+  "arguments": {
+    "path": "/issues.json",
+    "method": "post",
+    "data": {
+      "issue": {
+        "project_id": 1,
+        "subject": "New task",
+        "description": "Task description"
+      }
+    },
+    "user_identifier": "jan.kowalski@company.com"
+  }
+}
+```
+
+### API Key Resolution Logic
+
+The server resolves the API key in this order:
+
+1. **`user_identifier` provided + `REDMINE_USERS_MAP` configured** → Look up key in map. If user not found → **error** (no fallback, to prevent accidental use of wrong identity).
+2. **No `user_identifier` provided** → Use global `REDMINE_API_KEY` (if configured).
+3. **Neither available** → Error.
+
+### LLM System Prompt Integration
+
+If an LLM is involved in the tool-calling chain (e.g. OpenWebUI → LLM → n8n → MCP), the LLM's system prompt should instruct it to always pass the user identifier. Example system prompt addition:
+
+```
+When calling any Redmine MCP tool (redmine_request, redmine_upload, redmine_download),
+you MUST always include the "user_identifier" parameter with the current user's email address.
+This parameter is required for authentication — without it, the request will fail.
+The user_identifier is: {{USER_EMAIL}}
+```
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `REDMINE_URL` | Yes | - | URL of your Redmine instance. Subpaths are supported (e.g., `http://localhost/redmine/`) |
-| `REDMINE_API_KEY` | Yes | - | Your Redmine API key (see below for how to get it) |
+| `REDMINE_API_KEY` | Conditional | - | Your Redmine API key. Required unless `REDMINE_USERS_MAP` is configured. Used as fallback when no `user_identifier` is provided (see below for how to get it) |
+| `REDMINE_USERS_MAP` | Conditional | - | Path to a JSON file or inline JSON string mapping user identifiers to Redmine API keys. Required unless `REDMINE_API_KEY` is configured. At least one of `REDMINE_API_KEY` or `REDMINE_USERS_MAP` must be set |
 | `REDMINE_REQUEST_INSTRUCTIONS` | No | - | Path to a file containing additional instructions for the redmine_request tool. I've found it works great to have the LLM generate that file after a session. ([example1](INSTRUCTIONS_EXAMPLE1.md) [example2](INSTRUCTIONS_EXAMPLE2.md)) |
 | `REDMINE_HEADERS` | No | (empty) | Custom HTTP headers to include in all requests. Format: `"Header1: Value1, Header2: Value2"`. Useful for proxies that require additional authentication (e.g., `X-Redmine-Username`) |
 | `REDMINE_RESPONSE_FORMAT` | No | `yaml` | Response format: `yaml` or `json`. Controls how API responses are formatted |
@@ -165,6 +294,7 @@ Add to your `claude_desktop_config.json`:
     - `method` (string, optional): HTTP method to use (default: 'get')
     - `data` (object, optional): Dictionary for request body (for POST/PUT)
     - `params` (object, optional): Dictionary for query parameters
+    - `user_identifier` (string, **required in multi-user mode**): User identifier (e.g. email address) for API key resolution. The orchestrator (e.g. n8n) must provide this in every tool call.
   - Returns YAML string containing response status code, body and error message:
   ```yaml
   status_code: 200
@@ -182,6 +312,7 @@ Add to your `claude_desktop_config.json`:
   - Inputs:
     - `file_path` (string): Fully qualified path to the file to upload (must be within allowed directories)
     - `description` (string, optional): Optional description for the file
+    - `user_identifier` (string, **required in multi-user mode**): User identifier (e.g. email address) for API key resolution. The orchestrator (e.g. n8n) must provide this in every tool call.
   - Returns YAML string with the same format as redmine_request, including upload token:
   ```yaml
   status_code: 201
@@ -199,6 +330,7 @@ Add to your `claude_desktop_config.json`:
     - `attachment_id` (integer): The ID of the attachment to download
     - `save_path` (string): Fully qualified path where the file should be saved (must be within allowed directories)
     - `filename` (string, optional): Optional filename to use (determined automatically if not provided)
+    - `user_identifier` (string, **required in multi-user mode**): User identifier (e.g. email address) for API key resolution. The orchestrator (e.g. n8n) must provide this in every tool call.
   - Returns YAML string with download results:
   ```yaml
   status_code: 200
